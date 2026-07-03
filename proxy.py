@@ -415,16 +415,77 @@ def delete_account(email):
     return jsonify({"error": "Account not found"}), 404
 
 
+# ── Refresh-all progress tracking (for UI counter) ──
+_refresh_progress = {"total": 0, "done": 0, "success": 0, "fail": 0, "running": False}
+
+
 @app.route("/refresh-all", methods=["POST"])
 def do_refresh_all():
+    # If already running, return current progress
+    if _refresh_progress["running"]:
+        return jsonify({"status": "running", **_refresh_progress})
+
     # Backup tokens.json before refresh (preventive)
     import shutil
     try:
         shutil.copy2(TOKENS_FILE_FULL, TOKENS_FILE_FULL + ".bak")
     except Exception as e:
         print(f"[proxy] Backup before refresh-all failed: {e}")
-    success, fail = refresh_all()
-    return jsonify({"success": success, "fail": fail})
+
+    # Start refresh in background thread
+    data = load_tokens()
+    _refresh_progress["total"] = len(data["accounts"])
+    _refresh_progress["done"] = 0
+    _refresh_progress["success"] = 0
+    _refresh_progress["fail"] = 0
+    _refresh_progress["running"] = True
+
+    def _bg_refresh():
+        import auth as _auth
+        from config import REFRESH_URL
+        import requests as _req
+        d = _auth.load_tokens()
+        now = int(time.time())
+        for acc in d["accounts"]:
+            try:
+                headers = _auth._sign_headers()
+                body = {
+                    "source_id": acc.get("source_id", "autoclaw"),
+                    "device_id": acc["device_id"],
+                    "refresh_token": acc["refresh_token"],
+                }
+                resp = _req.post(REFRESH_URL, json=body, headers=headers, timeout=15, verify=False)
+                resp_data = resp.json()
+                if resp_data.get("code") == 0 and "data" in resp_data:
+                    new_access = resp_data["data"].get("access_token")
+                    new_refresh = resp_data["data"].get("refresh_token", acc["refresh_token"])
+                    if new_access:
+                        acc["access_token"] = new_access
+                        if new_refresh:
+                            acc["refresh_token"] = new_refresh
+                        acc["last_refreshed"] = now
+                        _refresh_progress["success"] += 1
+                    else:
+                        _refresh_progress["fail"] += 1
+                else:
+                    _refresh_progress["fail"] += 1
+            except Exception:
+                _refresh_progress["fail"] += 1
+            _refresh_progress["done"] += 1
+        # Save once at end
+        _auth.save_tokens(d)
+        _refresh_progress["running"] = False
+        print(f"[proxy] Refresh all done: {_refresh_progress['success']} ok, {_refresh_progress['fail']} fail")
+
+    t = threading.Thread(target=_bg_refresh, daemon=True)
+    t.start()
+
+    return jsonify({"status": "started", **_refresh_progress})
+
+
+@app.route("/api/refresh-progress", methods=["GET"])
+def refresh_progress():
+    return jsonify(_refresh_progress)
 
 
 @app.route("/wallet", methods=["GET"])
