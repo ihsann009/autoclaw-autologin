@@ -9,6 +9,7 @@ Uses [CloakBrowser](https://cloakbrowser.dev) — C++ source-level stealth Chrom
 ## Features
 
 - **Auto-Login**: Automated Google OAuth login for AutoClaw accounts (batch mode, concurrent)
+- **Rotating Proxy**: Bypass IP rate limit (630014) — each account uses a different proxy IP
 - **OpenAI-compatible Proxy**: Drop-in `/v1/chat/completions` endpoint — works with any OpenAI client
 - **Token Management**: Auto-refresh (24h TTL), round-robin rotation, wallet balance monitoring
 - **Dashboard**: Web UI at `http://localhost:31000` for monitoring accounts, credits, token expiry
@@ -24,8 +25,9 @@ Uses [CloakBrowser](https://cloakbrowser.dev) — C++ source-level stealth Chrom
 ```
 1. Double-click setup.bat      → installs deps + CloakBrowser binary (~535MB)
 2. Edit accounts.txt           → add email:password per line
-3. Double-click start-proxy.bat → starts proxy on http://localhost:31000
-4. Double-click run-batch.bat  → auto-login all accounts
+3. Edit proxies.txt            → add proxy list (host:port:user:pass per line)
+4. Double-click start-proxy.bat → starts proxy on http://localhost:31000
+5. Double-click run-batch.bat  → auto-login all accounts
 ```
 
 Done. Open `http://localhost:31000` in your browser to see the dashboard.
@@ -42,10 +44,14 @@ python -m playwright install-deps chromium
 cp accounts.txt.example accounts.txt
 # Edit accounts.txt — add email:password per line
 
-# 3. Start proxy (also starts OAuth callback server on port 18432)
+# 3. Copy proxy template
+cp proxies.txt.example proxies.txt
+# Edit proxies.txt — add host:port:user:pass per line
+
+# 4. Start proxy (also starts OAuth callback server on port 18432)
 python proxy.py
 
-# 4. Auto-login accounts (Google OAuth automation)
+# 5. Auto-login accounts (Google OAuth automation)
 python autoclaw_autologin.py --batch accounts.txt --interactive
 ```
 
@@ -68,6 +74,30 @@ python autoclaw_autologin.py --batch accounts.txt --force
 ```
 
 Account format in accounts.txt: `email:password` (one per line, # for comments)
+
+### Rotating Proxy (Required for Batch)
+
+Z.ai enforces IP rate limit (630014) — ~2 account registrations per IP before cooldown. Without rotating proxy, batch register will fail after 2 accounts.
+
+**Setup:**
+
+1. Get proxies from [webshare.io](https://webshare.io) or your provider
+2. Add to `proxies.txt` — one proxy per line:
+
+```
+host:port:username:password
+45.39.75.38:5952:user123:pass456
+82.21.231.11:7325:user123:pass456
+...
+```
+
+3. Run batch — each account automatically uses the next proxy (round-robin)
+
+**Rules of thumb:**
+- 1 proxy per account = best result (zero rate limit)
+- Fewer proxies than accounts = some IPs repeat (may hit rate limit on 3rd+ use)
+- No proxies.txt = batch blocked (use `--interactive` to override)
+- `proxies.txt` is gitignored — safe to add real credentials
 
 ### Interactive Login
 
@@ -151,14 +181,16 @@ curl http://localhost:31000/v1/chat/completions \
 
 ```
 autoclaw-autologin/
-├── config.py              # Constants, endpoints, model map
-├── auth.py                # Token management, refresh, validation
+├── config.py              # Constants, endpoints, model map, loads proxies.txt
+├── auth.py                # Token management, refresh, OAuth with rotating proxy
 ├── proxy.py               # Flask proxy server + OAuth callback + Dashboard API
 ├── login.py               # Interactive OAuth login helper
-├── autoclaw_autologin.py  # Batch auto-login (CloakBrowser)
+├── autoclaw_autologin.py  # Batch auto-login (CloakBrowser + proxy rotation)
 ├── tokens.json            # Token storage (auto-generated, gitignored)
 ├── accounts.txt           # email:password list (gitignored)
 ├── accounts.txt.example   # Template for accounts.txt
+├── proxies.txt            # Proxy list: host:port:user:pass (gitignored)
+├── proxies.txt.example    # Template for proxies.txt
 ├── requirements.txt       # Python deps (cloakbrowser, flask, requests, aiohttp)
 ├── setup.bat              # One-click setup (checks Python, installs deps + binary)
 ├── start-proxy.bat        # Start proxy server

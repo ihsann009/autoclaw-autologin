@@ -3,6 +3,11 @@ accounts.txt
 accounts-test.txt
 tokens.json
 providers_import.json
+proxies.txt
+config_local.py
+# Debug — never commit
+debug_*
+*.log
 
 # Python
 __pycache__/

@@ -53,9 +53,13 @@ def interactive_login():
 
     # Step 1: Get OAuth URL
     print("[1/3] Requesting OAuth URL...")
-    oauth_url, state, device_id = google_oauth_url()
+    oauth_url, state, device_id, err_info = google_oauth_url()
     if not oauth_url:
-        print("ERROR: Failed to get OAuth URL")
+        if err_info and err_info.get("code") == 400005:
+            print(f"ERROR: Rate limited (400005) — AutoClaw APP_ID shared across ALL users. "
+                  f"Retried {err_info.get('retried',0)}x. Try again later or off-peak.")
+        else:
+            print(f"ERROR: Failed to get OAuth URL — {err_info}")
         return
 
     print(f"\n[2/3] Open this URL in your browser and login with Google:\n")
@@ -122,9 +126,13 @@ def manual_login():
     print("\n=== AutoClaw Manual Login ===\n")
 
     print("[1/3] Requesting OAuth URL...")
-    oauth_url, state, device_id = google_oauth_url()
+    oauth_url, state, device_id, err_info = google_oauth_url()
     if not oauth_url:
-        print("ERROR: Failed to get OAuth URL")
+        if err_info and err_info.get("code") == 400005:
+            print(f"ERROR: Rate limited (400005) — AutoClaw APP_ID shared across ALL users. "
+                  f"Retried {err_info.get('retried',0)}x. Try again later or off-peak.")
+        else:
+            print(f"ERROR: Failed to get OAuth URL — {err_info}")
         return
 
     print(f"\nOpen this URL, login with Google:\n")

@@ -39,6 +39,7 @@ _pending_logins = {}  # keyed by state: {state: {"device_id":..., "result":..., 
 # ── Round-robin token rotation ──
 _token_idx = 0
 _token_lock = threading.Lock()
+_token_exchange_lock = threading.Lock()  # Serialize AutoClaw token exchanges (avoid 630014)
 
 # ── Request counter per account ──
 _request_counts = {}  # email → int
@@ -191,7 +192,7 @@ def chat_completions():
             json=upstream_body,
             headers=headers,
             stream=True,
-            timeout=120,
+            timeout=600,
             verify=False,
         )
 
@@ -206,13 +207,40 @@ def chat_completions():
             }), upstream_resp.status_code
 
         if client_wants_stream:
-            # Pass through SSE stream — filter non-data lines (e.g. ": OPENROUTER PROCESSING")
+            # Pass through SSE stream — filter reasoning, only forward content chunks
             def generate():
                 for line in upstream_resp.iter_lines():
                     if line:
-                        # Only forward valid SSE data lines
                         if line.startswith(b"data:"):
-                            yield line + b"\n\n"
+                            raw = line[5:].strip()
+                            if raw == b"[DONE]":
+                                yield line + b"\n\n"
+                                continue
+                            try:
+                                chunk = json.loads(raw)
+                                choices = chunk.get("choices", [])
+                                if choices:
+                                    delta = choices[0].get("delta", {})
+                                    # Strip reasoning fields — Cline/OpenAI clients don't understand them
+                                    if "reasoning" in delta:
+                                        del delta["reasoning"]
+                                    if "reasoning_details" in delta:
+                                        del delta["reasoning_details"]
+                                    if "reasoning_content" in delta:
+                                        del delta["reasoning_content"]
+                                    # Skip chunks with empty content and no tool_calls (pure thinking)
+                                    has_content = bool(delta.get("content"))
+                                    has_tool_calls = bool(delta.get("tool_calls"))
+                                    has_finish = bool(choices[0].get("finish_reason"))
+                                    # Only forward if there's actual content/tool_calls/finish
+                                    if not has_content and not has_tool_calls and not has_finish:
+                                        continue
+                                    # Clean native_finish_reason
+                                    if "native_finish_reason" in choices[0]:
+                                        del choices[0]["native_finish_reason"]
+                                yield b"data: " + json.dumps(chunk).encode() + b"\n\n"
+                            except (json.JSONDecodeError, KeyError):
+                                yield line + b"\n\n"
                 yield b"data: [DONE]\n\n"
             return Response(
                 generate(),
@@ -225,6 +253,7 @@ def chat_completions():
         else:
             # Aggregate stream → single JSON response (OpenAI non-stream format)
             full_content = ""
+            full_tool_calls = []
             finish_reason = None
             model_name = upstream_model
 
@@ -241,8 +270,23 @@ def chat_completions():
                         choices = chunk.get("choices", [])
                         if choices:
                             delta = choices[0].get("delta", {})
-                            if "content" in delta:
+                            if "content" in delta and delta["content"]:
                                 full_content += delta["content"]
+                            if "tool_calls" in delta and delta["tool_calls"]:
+                                for tc in delta["tool_calls"]:
+                                    idx = tc.get("index", 0)
+                                    while len(full_tool_calls) <= idx:
+                                        full_tool_calls.append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                                    if "id" in tc and tc["id"]:
+                                        full_tool_calls[idx]["id"] = tc["id"]
+                                    if "type" in tc and tc["type"]:
+                                        full_tool_calls[idx]["type"] = tc["type"]
+                                    if "function" in tc:
+                                        fn = tc["function"]
+                                        if "name" in fn and fn["name"]:
+                                            full_tool_calls[idx]["function"]["name"] += fn["name"]
+                                        if "arguments" in fn and fn["arguments"]:
+                                            full_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
                             if choices[0].get("finish_reason"):
                                 finish_reason = choices[0]["finish_reason"]
                         if chunk.get("model"):
@@ -252,6 +296,12 @@ def chat_completions():
                     except json.JSONDecodeError:
                         pass
 
+            message = {"role": "assistant", "content": full_content if full_content else None}
+            if full_tool_calls:
+                message["tool_calls"] = full_tool_calls
+                if not finish_reason:
+                    finish_reason = "tool_calls"
+
             response = {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
                 "object": "chat.completion",
@@ -259,7 +309,7 @@ def chat_completions():
                 "model": client_model,
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": full_content},
+                    "message": message,
                     "finish_reason": finish_reason or "stop",
                 }],
                 "usage": usage if 'usage' in dir() else {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
@@ -534,12 +584,18 @@ def api_login_url():
     """Generate Google OAuth URL for browser-based login.
     Stores pending state → auto-captured when /auth/callback-google is hit.
     """
-    from auth import google_oauth_url
-    oauth_url, state, device_id = google_oauth_url()
+    from auth import google_oauth_url, _next_proxy
+    # Get proxy BEFORE calling google_oauth_url so we can reuse it for token exchange
+    proxy_used = _next_proxy()
+    oauth_url, state, device_id, err_info = google_oauth_url(proxy=proxy_used)
     if oauth_url:
-        _pending_logins[state] = {"device_id": device_id, "result": None, "error": None}
+        _pending_logins[state] = {"device_id": device_id, "result": None, "error": None, "proxy": proxy_used}
         return jsonify({"oauth_url": oauth_url, "state": state, "device_id": device_id})
-    return jsonify({"error": "Failed to get OAuth URL"}), 500
+    # err_info = {"code": 400005, "msg": "Limit error", "retried": 5}
+    return jsonify({
+        "error": "Failed to get OAuth URL",
+        "detail": err_info,
+    }), 500
 
 
 @app.route("/auth/callback-google")
@@ -551,18 +607,13 @@ def auth_callback_google():
     state = request.args.get("state")
     error = request.args.get("error")
 
-    # Find pending login by state
+    # Find pending login by state — MUST match, no fallback in concurrent mode
     pending = _pending_logins.get(state)
     if not pending:
-        # Try to find any pending login (fallback for old-style)
-        if _pending_logins:
-            # State might not match exactly — find first pending without result
-            for s, p in _pending_logins.items():
-                if p.get("result") is None and p.get("error") is None:
-                    pending = p
-                    break
-        if not pending:
-            return "<html><body><h1>Login Failed</h1><p>Unknown state</p></body></html>", 400
+        # No state match — do NOT fallback to "first pending" (causes cross-account
+        # contamination in concurrent mode). Just fail this callback.
+        print(f"[callback] Unknown state={state[:20]}... (not in {len(_pending_logins)} pending)")
+        return "<html><body><h1>Login Failed</h1><p>Unknown state</p></body></html>", 400
 
     if error:
         pending["error"] = error
@@ -573,11 +624,20 @@ def auth_callback_google():
         return "<html><body><h1>Login Failed</h1><p>No code</p></body></html>", 400
 
     device_id = pending.get("device_id")
+    proxy_used = pending.get("proxy")  # Reuse same proxy from URL generation
 
-    result = google_oauth_login(code, state, device_id)
+    # Serialize token exchanges — AutoClaw API rate-limits per IP (630014).
+    # Without this, 3 concurrent callbacks all hit the API simultaneously → all fail.
+    # Lock ensures 1 exchange at a time, with small gap between.
+    with _token_exchange_lock:
+        print(f"[callback] Exchanging token for state={state[:12]}... device_id={device_id[:8]}... proxy={'yes' if proxy_used else 'none'}")
+        result = google_oauth_login(code, state, device_id, proxy=proxy_used)
+        time.sleep(2)  # Gap so next concurrent callback doesn't hit 630014
     if not result:
+        print(f"[callback] Token exchange FAILED for state={state[:12]}... (google_oauth_login returned None)")
         pending["error"] = "Token exchange failed"
         return "<html><body><h1>Login Failed</h1><p>Token exchange failed</p></body></html>", 500
+    print(f"[callback] Token exchange OK for state={state[:12]}... user_id={result.get('user_id')}")
 
     # Extract email from JWT jti field
     import base64 as _b64
@@ -689,7 +749,7 @@ def api_test_chat():
                 "messages": [{"role": "user", "content": message}],
                 "stream": False,
             },
-            timeout=120,
+            timeout=600,
         )
         if resp.status_code == 200:
             data = resp.json()

@@ -13,9 +13,30 @@ from config import (
     USER_API_BASE, GOOGLE_OAUTH_URL, GOOGLE_OAUTH_LOGIN,
     REFRESH_URL, PROFILE_URL, WALLET_URL, LEDGER_URL,
     TOKENS_FILE, ACCESS_TOKEN_TTL, REFRESH_MARGIN,
+    PROXY_LIST,
 )
 
 _lock = threading.Lock()
+_proxy_counter = 0
+
+def _next_proxy():
+    """Get next proxy in round-robin. Returns dict or None."""
+    global _proxy_counter
+    if not PROXY_LIST:
+        return None
+    proxy = PROXY_LIST[_proxy_counter % len(PROXY_LIST)]
+    _proxy_counter += 1
+    return proxy
+
+def _proxies(proxy):
+    """Convert proxy dict to requests format. Returns None if no proxy."""
+    if not proxy:
+        return None
+    url = proxy["server"]
+    if "username" in proxy:
+        # Insert auth into URL
+        url = url.replace("http://", f"http://{proxy['username']}:{proxy['password']}@")
+    return {"http": url, "https": url}
 
 
 def _sign_headers():
@@ -245,8 +266,14 @@ def check_ledger(access_token):
         return {"error": str(e)}
 
 
-def google_oauth_url(device_id=None, navigate_uri="http://localhost:18432/auth/callback-google"):
-    """Step 1: Get Google OAuth URL."""
+def google_oauth_url(device_id=None, navigate_uri="http://localhost:18432/auth/callback-google",
+                     max_retries=5, retry_delay=3, proxy=None):
+    """Step 1: Get Google OAuth URL.
+    Retries on 400005 rate limit (shared APP_ID 100003 — all users compete for same quota).
+    Uses rotating proxy to bypass 630014 IP rate limit.
+    Returns: (oauth_url, state, device_id, err_info)
+      err_info = None on success, or {"code":N, "msg":"...", "retried":N} on failure.
+    """
     headers = _sign_headers()
     if not device_id:
         device_id = str(uuid.uuid4())
@@ -255,15 +282,56 @@ def google_oauth_url(device_id=None, navigate_uri="http://localhost:18432/auth/c
         "device_id": device_id,
         "navigate_uri": navigate_uri,
     }
-    resp = requests.post(GOOGLE_OAUTH_URL, json=body, headers=headers, timeout=15, verify=False)
-    data = resp.json()
-    if data.get("code") == 0:
-        return data["data"]["oauth_url"], data["data"]["state"], device_id
-    return None, None, device_id
+    px = _proxies(proxy) if proxy else _proxies(_next_proxy())
+    import time as _time
+    retries_done = 0
+    last_code = None
+    last_msg = ""
+    for attempt in range(max_retries):
+        retries_done = attempt + 1
+        resp = requests.post(GOOGLE_OAUTH_URL, json=body, headers=headers, timeout=15, verify=False, proxies=px)
+        try:
+            data = resp.json()
+        except Exception:
+            print(f"[auth] google_oauth_url bad response: HTTP {resp.status_code}, body={resp.text[:200]}")
+            last_code = resp.status_code
+            last_msg = f"Bad HTTP response (HTTP {resp.status_code})"
+            if attempt < max_retries - 1:
+                _time.sleep(retry_delay)
+                continue
+            return None, None, device_id, {"code": last_code, "msg": last_msg, "retried": retries_done}
+
+        if data.get("code") == 0:
+            return data["data"]["oauth_url"], data["data"]["state"], device_id, None
+
+        code = data.get("code")
+        msg = data.get("msg", "")
+        last_code = code
+        last_msg = msg
+        if code == 400005:
+            # Rate limit — shared APP_ID, all users compete. Retry with delay.
+            print(f"[auth] google_oauth_url rate-limited (400005), retry {attempt+1}/{max_retries} in {retry_delay}s...")
+            if attempt < max_retries - 1:
+                _time.sleep(retry_delay)
+                continue
+        if code == 630014:
+            # IP rate limit — try switching proxy
+            print(f"[auth] google_oauth_url IP rate-limited (630014) via proxy, retry {attempt+1}/{max_retries}...")
+            px = _proxies(_next_proxy())
+            if attempt < max_retries - 1:
+                _time.sleep(retry_delay)
+                continue
+        # Other errors — don't retry
+        print(f"[auth] google_oauth_url failed: code={code}, msg={msg}")
+        return None, None, device_id, {"code": code, "msg": msg, "retried": retries_done}
+    return None, None, device_id, {"code": last_code, "msg": last_msg, "retried": retries_done}
 
 
-def google_oauth_login(code, state, device_id, navigate_uri="http://localhost:18432/auth/callback-google"):
-    """Step 2: Exchange Google OAuth code for AutoClaw tokens."""
+def google_oauth_login(code, state, device_id, navigate_uri="http://localhost:18432/auth/callback-google", proxy=None):
+    """Step 2: Exchange Google OAuth code for AutoClaw tokens.
+    Retries on 630014 (IP rate limit) by switching proxy.
+    Reuses same proxy from URL generation if provided.
+    """
     headers = _sign_headers()
     body = {
         "code": code,
@@ -272,19 +340,51 @@ def google_oauth_login(code, state, device_id, navigate_uri="http://localhost:18
         "device_id": device_id,
         "source_id": "autoclaw",
     }
-    resp = requests.post(GOOGLE_OAUTH_LOGIN, json=body, headers=headers, timeout=15, verify=False)
-    data = resp.json()
-    if data.get("code") == 0 and "data" in data:
-        d = data["data"]
-        return {
-            "access_token": d.get("access_token"),
-            "refresh_token": d.get("refresh_token"),
-            "user_id": d.get("user_id"),
-            "user_name": d.get("user_name"),
-            "first_login": d.get("first_login"),
-            "device_id": device_id,
-        }
-    print(f"[auth] OAuth login failed: {data}")
+    # Use provided proxy (same as URL gen), or get next from round-robin
+    if proxy:
+        px = _proxies(proxy)
+    else:
+        px = _proxies(_next_proxy())
+
+    # Retry on 630014 (IP rate limit) — try switching proxy
+    import time as _time
+    for attempt in range(3):
+        resp = requests.post(GOOGLE_OAUTH_LOGIN, json=body, headers=headers, timeout=15, verify=False, proxies=px)
+        try:
+            data = resp.json()
+        except Exception:
+            print(f"[auth] OAuth login bad response: HTTP {resp.status_code}, body={resp.text[:200]}")
+            if attempt < 2:
+                _time.sleep(1)
+                # Switch proxy for retry
+                px = _proxies(_next_proxy())
+                continue
+            return None
+
+        if data.get("code") == 0 and "data" in data:
+            d = data["data"]
+            return {
+                "access_token": d.get("access_token"),
+                "refresh_token": d.get("refresh_token"),
+                "user_id": d.get("user_id"),
+                "user_name": d.get("user_name"),
+                "first_login": d.get("first_login"),
+                "device_id": device_id,
+            }
+
+        code_val = data.get("code")
+        msg = data.get("msg", "")
+        print(f"[auth] OAuth login failed: HTTP {resp.status_code}, code={code_val}, msg={msg}, full={data}")
+
+        if code_val == 630014 and attempt < 2:
+            # IP rate limit — switch proxy and retry
+            print(f"[auth] OAuth login IP rate-limited (630014), retry {attempt+1}/3 with different proxy...")
+            px = _proxies(_next_proxy())
+            _time.sleep(1)
+            continue
+        # Non-retryable error (400001, 631001, etc.) — fail immediately
+        return None
+
     return None
 
 

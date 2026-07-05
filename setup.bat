@@ -45,6 +45,15 @@ if not exist "accounts.txt" (
     )
 )
 
+REM ── Create proxies.txt from template if not exists ──
+if not exist "proxies.txt" (
+    if exist "proxies.txt.example" (
+        copy "proxies.txt.example" "proxies.txt" >nul
+        echo  Created proxies.txt from template.
+        echo  ^>^> Edit proxies.txt and add your proxy lines (host:port:user:pass) ^<^<
+    )
+)
+
 echo.
 echo  Installing Python dependencies...
 pip install flask requests cloakbrowser aiohttp 2>nul
@@ -72,9 +81,10 @@ echo  Setup complete!
 echo.
 echo  Next steps:
 echo    1. Edit accounts.txt - add email:password per line
-echo    2. Double-click start-proxy.bat to start proxy
-echo    3. Double-click run-batch.bat to login all accounts
-echo    4. Or double-click run-test.bat to test single account
+echo    2. Edit proxies.txt  - add host:port:user:pass per line
+echo    3. Double-click start-proxy.bat to start proxy
+echo    4. Double-click run-batch.bat to login all accounts
+echo    5. Or double-click run-test.bat to test single account
 echo.
 echo  CloakBrowser binary: ~/.cloakbrowser\
 echo  Dashboard: http://localhost:31000

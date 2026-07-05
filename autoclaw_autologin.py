@@ -44,10 +44,22 @@ DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 PROXY_BASE = "http://localhost:31000"
 
 
+# ── Terminal colors (Windows Terminal / ANSI) ──
+C_RED = "\033[91m"
+C_YELLOW = "\033[93m"
+C_GREEN = "\033[92m"
+C_CYAN = "\033[96m"
+C_BOLD = "\033[1m"
+C_DIM = "\033[2m"
+C_RESET = "\033[0m"
+
 def log(msg, level="INFO"):
     ts = time.strftime("%H:%M:%S")
+    colors = {"INFO": "", "OK": C_GREEN, "ERR": C_RED, "DBG": C_DIM, "WAIT": C_YELLOW}
     pfx = {"INFO": "ℹ", "OK": "✅", "ERR": "❌", "DBG": "🔍", "WAIT": "⏳"}.get(level, " ")
-    print(f"[{ts}] {pfx} {msg}", flush=True)
+    c = colors.get(level, "")
+    r = C_RESET if c else ""
+    print(f"[{ts}] {c}{pfx} {msg}{r}", flush=True)
 
 def dbg(msg):
     if DEBUG:
@@ -59,11 +71,30 @@ def dbg(msg):
 # ══════════════════════════════════════════════════════════════════════
 def get_oauth_url():
     """Call proxy /api/login-url to get OAuth URL + state + device_id."""
-    resp = req_lib.post(f"{PROXY_BASE}/api/login-url", timeout=15)
-    data = resp.json()
+    try:
+        resp = req_lib.post(f"{PROXY_BASE}/api/login-url", timeout=120)
+        data = resp.json()
+    except Exception as e:
+        log(f"Failed to get OAuth URL: proxy request failed ({e})", "ERR")
+        return None, None, None
+
     if "oauth_url" in data:
         return data["oauth_url"], data["state"], data["device_id"]
-    log(f"Failed to get OAuth URL: {data}", "ERR")
+
+    # Error — show useful detail
+    detail = data.get("detail") or {}
+    err_code = detail.get("code", "?")
+    err_msg = detail.get("msg", data.get("error", "Unknown"))
+    retried = detail.get("retried", 0)
+
+    if err_code == 400005:
+        log(f"OAuth URL failed: RATE LIMITED (400005) — AutoClaw APP_ID shared across ALL users, "
+            f"server is throttling. Retried {retried}x. Try again later or off-peak.", "ERR")
+    elif err_code == 400001:
+        log(f"OAuth URL failed: REQUEST DATA ERROR (400001) — {err_msg}. "
+            f"Check device_id/navigate_uri. Retried {retried}x.", "ERR")
+    else:
+        log(f"OAuth URL failed: code={err_code}, msg={err_msg} (retried {retried}x)", "ERR")
     return None, None, None
 
 
@@ -166,16 +197,21 @@ async def _handle_google_login(page, email, password):
     """Handle Google's login page: email → password → consent → redirect."""
     log(f"[{email}] On Google login page. Automating...")
 
-    for attempt in range(60):
+    for attempt in range(120):
+        # Check URL — if page closed, we can't do anything more
         try:
             url = page.url
         except:
             log(f"[{email}] Page closed/navigated away", "OK")
             return
 
+        # Debug: log exact URL on first few attempts
+        if attempt < 2:
+            dbg(f"[{email}] attempt={attempt} url={url[:80]}")
+
         # ── Check if we left Google (redirect back to callback) ──
-        if "accounts.google.com" not in url and "accounts.google.co" not in url:
-            log(f"[{email}] Left Google. Now at: {url[:60]}", "OK")
+        if "google.com" not in url:
+            log(f"[{email}] Left Google. Now at: {url[:80]}", "OK")
             return
 
         # ── Check if page shows Login Success ──
@@ -184,19 +220,26 @@ async def _handle_google_login(page, email, password):
             if "Login Success" in content:
                 log(f"[{email}] Login Success detected in page!", "OK")
                 return
-        except:
+            # Also check if we're on callback page (localhost) — check hostname only
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            if parsed.hostname in ("localhost", "127.0.0.1"):
+                log(f"[{email}] On callback page — login complete!", "OK")
+                return
+        except Exception as e:
+            dbg(f"[{email}] content check exception: {e}")
             pass
 
         # ── Email step ──
+        email_visible = False
         try:
             email_visible = await page.evaluate("""() => {
                 const el = document.querySelector('#identifierId');
                 return el && el.offsetParent !== null;
             }""")
         except:
-            email_visible = False
             await asyncio.sleep(0.5)
-            continue
+            # DON'T continue — fall through to consent handler below
 
         if email_visible:
             dbg(f"[{email}] Filling Google email...")
@@ -230,6 +273,7 @@ async def _handle_google_login(page, email, password):
             continue
 
         # ── Password step ──
+        pwd_visible = False
         try:
             pwd_visible = await page.evaluate("""() => {
                 for (const el of document.querySelectorAll(
@@ -239,9 +283,8 @@ async def _handle_google_login(page, email, password):
                 return false;
             }""")
         except:
-            pwd_visible = False
             await asyncio.sleep(0.5)
-            continue
+            # DON'T continue — fall through to consent handler below
 
         if pwd_visible:
             dbg(f"[{email}] Filling Google password...")
@@ -280,49 +323,20 @@ async def _handle_google_login(page, email, password):
             except:
                 return
 
-            # Look for consent buttons on the next page
-            try:
-                consent_clicked = await page.evaluate("""() => {
-                    const knownIds = ['submit_approve_access', 'approve_button', 'confirm'];
-                    for (const id of knownIds) {
-                        const el = document.getElementById(id);
-                        if (el && el.offsetParent !== null) {
-                            el.click(); return 'clicked id: ' + id;
-                        }
-                    }
-                    const buttons = document.querySelectorAll(
-                        'button, [role="button"], span[role="button"]'
-                    );
-                    const consentTexts = [
-                        'allow', 'continue', 'approve', 'confirm', 'accept', 'next',
-                        'i understand', 'agree', 'done',
-                        'izinkan', 'lanjutkan', 'setuju', 'terima'
-                    ];
-                    for (const btn of buttons) {
-                        const txt = (btn.textContent || '').toLowerCase().trim();
-                        if (consentTexts.some(t => txt.includes(t))) {
-                            btn.click();
-                            if (btn.tagName === 'SPAN' && btn.parentElement) {
-                                btn.parentElement.click();
-                            }
-                            return 'clicked: ' + txt;
-                        }
-                    }
-                    return null;
-                }""")
-                if consent_clicked:
-                    dbg(f"[{email}] Post-password consent: {consent_clicked}")
-                    await asyncio.sleep(1)
-            except:
-                pass
+        # ── Consent / Agreement / Speedbump screens ──
+        # Only run if NOT on email/password page (avoid clicking "Next" on login buttons)
+        # Consent handler runs after email+password checks above — if we reach here,
+        # we're either on consent page, account chooser, or transitioning.
+        # Guard: skip if password field still visible (page hasn't navigated yet)
+        if pwd_visible:
+            await asyncio.sleep(0.5)
             continue
 
-        # ── Consent / Agreement / Speedbump screens ──
+        consent_clicked = None
         try:
             consent_clicked = await page.evaluate("""() => {
-                // Priority 1: Known IDs
-                const knownIds = ['confirm', 'submit_approve_access', 'approve_button',
-                                 'next', 'identifierNext', 'passwordNext'];
+                // Priority 1: Known consent IDs (NOT identifierNext/passwordNext/next — those are login step buttons)
+                const knownIds = ['submit_approve_access', 'approve_button', 'confirm'];
                 for (const id of knownIds) {
                     const el = document.getElementById(id);
                     if (el && el.offsetParent !== null) {
@@ -343,11 +357,13 @@ async def _handle_google_login(page, email, password):
                     'span.VfPpkd-vQzf8d, div.VfPpkd-RLmnJb, [jsname="V67aGc"]'
                 );
                 const consentTexts = [
-                    'i understand', 'i agree', 'agree', 'allow', 'continue', 'next',
+                    'i understand', 'i agree', 'agree', 'allow', 'continue',
                     'approve', 'confirm', 'accept', 'got it', 'accept all', 'done',
                     'i accept', 'accept & continue',
+                    'sign in', 'log in', 'get started', 'proceed',
                     'saya mengerti', 'saya setuju', 'setuju', 'lanjutkan', 'terima',
-                    'izinkan', 'konfirmasi', 'mengerti', 'oke', 'ya'
+                    'izinkan', 'konfirmasi', 'mengerti', 'oke', 'ya',
+                    'masuk', 'mulai', 'lanjut'
                 ];
                 for (const btn of buttons) {
                     const txt = (btn.textContent || btn.value || '').toLowerCase().trim();
@@ -359,15 +375,51 @@ async def _handle_google_login(page, email, password):
                         return 'clicked text: ' + txt;
                     }
                 }
+                // Priority 4: "Advanced" link (unverified app warning)
+                const advEl = document.querySelector('#advancedButton') ||
+                              document.querySelector('[id*="advanced"]');
+                if (advEl) { advEl.click(); return 'clicked: advanced'; }
+                for (const el of document.querySelectorAll('a, button, span')) {
+                    const t = (el.textContent || '').toLowerCase();
+                    if (t.includes('advanced') || t.includes('lanjutan')) {
+                        el.click(); return 'clicked: advanced (text)';
+                    }
+                }
                 return null;
             }""")
-        except Exception:
-            consent_clicked = None
+        except Exception as e:
+            dbg(f"[{email}] Consent evaluate exception: {e}")
 
         if consent_clicked:
             dbg(f"[{email}] Consent: {consent_clicked}")
-            await asyncio.sleep(0.5)
+            # If we clicked "Advanced", look for "Go to [app] (unsafe)" link
+            if "advanced" in str(consent_clicked):
+                await asyncio.sleep(1.5)
+                try:
+                    unsafe_clicked = await page.evaluate("""() => {
+                        const links = document.querySelectorAll('a, button, [role="button"]');
+                        for (const el of links) {
+                            const t = (el.textContent || '').toLowerCase();
+                            if (t.includes('go to') || t.includes('unsafe') || t.includes('proceed')) {
+                                el.click(); return 'clicked: ' + t.trim().substring(0, 40);
+                            }
+                        }
+                        return null;
+                    }""")
+                    if unsafe_clicked:
+                        dbg(f"[{email}] Unsafe link: {unsafe_clicked}")
+                        await asyncio.sleep(2)
+                except:
+                    pass
+                continue
+            # Normal consent click — continue loop immediately
+            # Next iteration will detect callback redirect or click again if still on consent
+            await asyncio.sleep(0.3)
             continue
+        else:
+            # Debug: log URL every 5 attempts
+            if attempt % 5 == 0:
+                dbg(f"[{email}] Waiting... attempt={attempt} url={url[:80]}")
 
         # ── Choose account page ──
         try:
@@ -385,7 +437,7 @@ async def _handle_google_login(page, email, password):
 
         await asyncio.sleep(0.5)
 
-    log(f"[{email}] Google login timed out (90s)", "ERR")
+    log(f"[{email}] Google login timed out (180s)", "ERR")
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -415,7 +467,11 @@ def check_login_result(state=None):
 # ══════════════════════════════════════════════════════════════════════
 async def process_account(email, password, test_only=False):
     tag = "[TEST] " if test_only else ""
-    log(f"{tag}Processing: {email}")
+    # Check proxy for this account
+    from auth import _next_proxy
+    _px = _next_proxy()
+    _px_host = _px["server"].split("//")[-1] if _px else "direct"
+    log(f"{tag}Processing: {email}" + (f" via {_px_host}" if _px else ""))
 
     # Check if already in tokens.json
     tokens = load_tokens()
@@ -424,7 +480,7 @@ async def process_account(email, password, test_only=False):
         log(f"Already have token for {email}, skipping. Use --force to re-login.", "OK")
         return {"success": True, "email": email, "skipped": True}
 
-    # 1. Get OAuth URL
+    # 1. Get OAuth URL (uses rotating proxy from config)
     oauth_url, state, device_id = get_oauth_url()
     if not oauth_url:
         return {"success": False, "email": email, "error": "oauth_url_failed"}
@@ -523,7 +579,7 @@ Account format (in file):
     parser.add_argument("--headless", action="store_true",
                         help="Run browser in headless mode (invisible)")
     parser.add_argument("--concurrent", "-c", type=int, default=1,
-                        help="Number of concurrent browser sessions (default: 1)")
+                        help="Number of concurrent browser sessions (default: 1, max: 3 — higher gets blocked by Google without proxy)")
     parser.add_argument("--debug", "-d", action="store_true",
                         help="Enable debug output")
     parser.add_argument("--interactive", "-i", action="store_true",
@@ -588,6 +644,41 @@ async def main():
                 log("All accounts already exist. Nothing to do.", "OK")
                 sys.exit(0)
 
+    # ── Proxy check ──
+    from config import PROXY_LIST as _PROXIES
+    proxy_count = len(_PROXIES) if _PROXIES else 0
+    if proxy_count == 0:
+        print()
+        print(f"  {C_RED}{C_BOLD}⚠️  WARNING: No proxy configured!{C_RESET}")
+        print(f"  {C_RED}─────────────────────────────────────────────────────────{C_RESET}")
+        print(f"  Registering multiple accounts without proxy will hit")
+        print(f"  {C_YELLOW}rate limit (630014){C_RESET} after ~2 accounts per IP.")
+        print()
+        print(f"  {C_BOLD}To enable rotating proxy:{C_RESET}")
+        print(f"    {C_CYAN}1.{C_RESET} Create {C_BOLD}proxies.txt{C_RESET} in this folder")
+        print(f"    {C_CYAN}2.{C_RESET} Add one proxy per line: {C_DIM}host:port:username:password{C_RESET}")
+        print(f"       {C_DIM}45.39.75.38:5952:user123:pass456{C_RESET}")
+        print(f"       {C_DIM}82.21.231.11:7325:user123:pass456{C_RESET}")
+        print(f"    {C_CYAN}3.{C_RESET} Get proxies from {C_CYAN}webshare.io{C_RESET} or your provider")
+        print(f"    {C_CYAN}4.{C_RESET} {C_YELLOW}One proxy per account recommended{C_RESET}")
+        print(f"  {C_RED}─────────────────────────────────────────────────────────{C_RESET}")
+        print()
+        if args.interactive:
+            cont = input(f"  {C_YELLOW}Continue without proxy? [y/N]: {C_RESET}").strip().lower()
+            if cont != "y":
+                print("  Cancelled. Configure proxies.txt first.")
+                sys.exit(0)
+            print()
+        elif len(accounts) > 2 and not args.test and not args.force:
+            print(f"  {C_RED}Aborting. Use --interactive to override.{C_RESET}")
+            sys.exit(1)
+    elif proxy_count < len(accounts):
+        print(f"  {C_YELLOW}Proxy:{C_RESET} {proxy_count} proxies for {len(accounts)} accounts (some IPs will repeat)")
+        print()
+    else:
+        print(f"  {C_GREEN}Proxy:{C_RESET} {proxy_count} rotating proxies ready")
+        print()
+
     # ── Interactive mode ──
     if args.interactive:
         print(f"  [i] Found {len(accounts)} account(s)")
@@ -608,10 +699,10 @@ async def main():
         print()
 
         # Ask concurrent
-        conc_input = input("  Concurrent browsers (1-5) [1]: ").strip()
+        conc_input = input("  Concurrent browsers (1-3) [1]: ").strip()
         try:
-            conc = int(conc_input)
-            conc = max(1, min(5, conc))
+            conc = int(conc_input) if conc_input else 1
+            conc = max(1, min(3, conc))
         except:
             conc = 1
         args.concurrent = conc
@@ -619,10 +710,12 @@ async def main():
 
         # Summary
         mode_str = "Headless (invisible)" if HEADLESS else "Visible"
+        proxy_count = len(_PROXIES) if _PROXIES else 0
         print("  +--------------------------------------+")
         print(f"  |  Accounts:   {len(accounts)}")
         print(f"  |  Browser:    {mode_str}")
         print(f"  |  Concurrent: {args.concurrent}")
+        print(f"  |  Proxies:    {proxy_count}" + (" (rotating per account)" if proxy_count else " (NONE — will hit rate limit!)"))
         print(f"  |  Save to:    tokens.json")
         print("  +--------------------------------------+")
         print()
@@ -640,7 +733,8 @@ async def main():
     # Header
     mode = "HEADLESS" if HEADLESS else "VISIBLE"
     test = " | TEST MODE" if args.test else ""
-    log(f"AutoClaw Auto-Login | {len(accounts)} account(s) | {mode} | concurrent={args.concurrent}{test}")
+    proxy_str = f"{len(_PROXIES)} proxies" if _PROXIES else "no proxy"
+    log(f"AutoClaw Auto-Login | {len(accounts)} account(s) | {mode} | concurrent={args.concurrent} | {proxy_str}{test}")
 
     # Run
     start = time.time()
