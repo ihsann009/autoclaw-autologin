@@ -52,6 +52,7 @@ def _sign_headers():
         "X-Tm": PLATFORM,
         "X-Trace-Id": str(uuid.uuid4()),
         "Content-Type": "application/json",
+        "User-Agent": f"AutoClaw/{VERSION}",
     }
 
 

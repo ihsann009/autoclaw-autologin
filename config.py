@@ -6,12 +6,12 @@ import os
 APP_ID = "100003"
 APP_KEY = "38d2391985e2369a5fb8227d8e6cd5e5"
 PRODUCT = "autoclaw"
-VERSION = "1.9.1"
+VERSION = "4.6.2"
 PLATFORM = "win"
 
 # ── Endpoints ──
-USER_API_BASE = "https://autoglm-api.autoglm.ai"
-LLM_PROXY_BASE = "https://autoglm-api.autoglm.ai/autoclaw-proxy/proxy/autoclaw"
+USER_API_BASE = "https://autoglm-api.zhipuai.cn"
+LLM_PROXY_BASE = "https://autoglm-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw"
 CHAT_COMPLETIONS = f"{LLM_PROXY_BASE}/chat/completions"
 
 # ── Auth Endpoints ──
