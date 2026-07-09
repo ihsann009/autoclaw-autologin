@@ -15,8 +15,8 @@ LLM_PROXY_BASE = "https://autoglm-api.zhipuai.cn/autoclaw-proxy/proxy/autoclaw"
 CHAT_COMPLETIONS = f"{LLM_PROXY_BASE}/chat/completions"
 
 # ── Auth Endpoints ──
-GOOGLE_OAUTH_URL = f"{USER_API_BASE}/userapi/overseasv1/google-oauth-url"
-GOOGLE_OAUTH_LOGIN = f"{USER_API_BASE}/userapi/overseasv1/google-oauth-login"
+GOOGLE_OAUTH_URL = f"{USER_API_BASE}/userapi/overseasv1/zai-oauth-url"
+GOOGLE_OAUTH_LOGIN = f"{USER_API_BASE}/userapi/overseasv1/zai-oauth-login"
 REFRESH_URL = f"{USER_API_BASE}/userapi/v1/refresh"
 PROFILE_URL = f"{USER_API_BASE}/userapi/v1/user-profile"
 WALLET_URL = f"{USER_API_BASE}/agent-assetmgr/api/v2/wallets?biz_app_id=autoclaw"
